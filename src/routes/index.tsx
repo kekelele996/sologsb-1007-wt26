@@ -10,14 +10,52 @@ import {
   createSignal,
   onCleanup,
   onMount,
-  untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import { uid } from "../data";
+import {
+  applyConflictChoices,
+  charDiff,
+  mergeProjects,
+  sameFieldValue,
+  stampLocalEdits,
+} from "../merge";
+import {
+  downloadText,
+  formatTime,
+  getAuthor,
+  getTabId,
+  loadConflicts,
+  loadProject,
+  parseTime,
+  saveConflicts,
+  saveProject,
+  setAuthor,
+} from "../persistence";
+import type {
+  Confidence,
+  ConflictCandidate,
+  ConflictMap,
+  FieldConflict,
+  FieldKey,
+  PersistedEnvelope,
+  ProjectData,
+  Segment,
+  TranscriptTrack,
+} from "../types";
+import { conflictKey } from "../types";
 
-const CHANNEL_NAME = "sologsb-1007-editor";
-const TAB_ID = uid("tab");
+const CHANNEL_NAME = "sologsb-1007-editor-v2";
+const TAB_ID = getTabId();
+
+const FIELD_LABELS: Record<FieldKey, string> = {
+  text: "正文",
+  speakerId: "发言人",
+  start: "开始时间码",
+  end: "结束时间码",
+  confidence: "置信度",
+  flags: "校对标记",
+  tagIds: "片段关联",
+};
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -31,6 +69,20 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
   const srtPattern = /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/;
   const bracketPattern = /^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*[-–]?\s*(.*)$/;
 
+  const blankSegment = (start: number, end: number, text: string): Segment => ({
+    id: uid("seg"),
+    start,
+    end,
+    speakerId: text.match(/^([^：:]{1,10})[：:]/) ? "sp-custom" : "sp-interviewer",
+    text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
+    confidence: 3,
+    reviewed: false,
+    flags: { lowConfidence: false, dialect: false, properNoun: false },
+    tagIds: [],
+    comments: [],
+    meta: { fields: {}, reviewedAt: 0, reviewedBy: "", createdAt: Date.now() },
+  });
+
   for (const rawBlock of blocks) {
     const lines = rawBlock.split("\n").map((line) => line.trim()).filter(Boolean);
     if (!lines.length) continue;
@@ -38,19 +90,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
     if (srtIndex >= 0) {
       const match = srtPattern.exec(lines[srtIndex]);
       const text = lines.slice(srtIndex + 1).join(" ");
-      const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start: parseTime(match?.[1] ?? "0"),
-        end: parseTime(match?.[2] ?? "1"),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(blankSegment(parseTime(match?.[1] ?? "0"), parseTime(match?.[2] ?? "1"), text));
       continue;
     }
     for (const line of lines) {
@@ -58,36 +98,13 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
       if (!match) continue;
       const start = parseTime(match[1]);
       const text = match[2];
-      const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start,
-        end: start + Math.max(3, text.length / 5),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(blankSegment(start, start + Math.max(3, text.length / 5), text));
     }
   }
 
   if (!segments.length && input.trim()) {
     input.split("\n").map((line) => line.trim()).filter(Boolean).forEach((text, index) => {
-      segments.push({
-        id: uid("seg"),
-        start: index * 6,
-        end: index * 6 + 5.4,
-        speakerId: "sp-interviewer",
-        text,
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(blankSegment(index * 6, index * 6 + 5.4, text));
     });
   }
 
@@ -106,27 +123,37 @@ export default function OralHistoryEditor() {
   const [revision, setRevision] = createSignal(loaded.revision);
   const [past, setPast] = createSignal<ProjectData[]>([]);
   const [future, setFuture] = createSignal<ProjectData[]>([]);
-  const [selectedId, setSelectedId] = createSignal(loaded.project.tracks[0]?.segments[0]?.id ?? "");
+  const [selectedId, setSelectedId] = createSignal(
+    loaded.project.tracks.find((track) => track.id === loaded.project.activeTrackId)?.segments[0]?.id
+      ?? loaded.project.tracks[0]?.segments[0]?.id
+      ?? "",
+  );
   const [saveStatus, setSaveStatus] = createSignal<"saved" | "saving" | "offline">("saved");
-  const [lastAction, setLastAction] = createSignal("示例项目已就绪");
-  const [conflict, setConflict] = createSignal<PersistedEnvelope | null>(null);
+  const [lastAction, setLastAction] = createSignal(loaded.migrated ? "旧草稿已升级为按片段合并的新结构" : "示例项目已就绪");
+  const [conflicts, setConflicts] = createSignal<ConflictMap>(loadConflicts(TAB_ID));
+  const [choices, setChoices] = createSignal<Record<string, number>>({});
+  const [activeTab, setActiveTab] = createSignal(loaded.project.activeTrackId);
   const [online, setOnline] = createSignal(true);
+  const [pendingCount, setPendingCount] = createSignal(0);
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
+  const [authorName, setAuthorName] = createSignal(getAuthor());
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
+  let offlineEdits = 0;
 
   const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(CHANNEL_NAME) : null;
   const activeTrack = createMemo(() => {
     const data = project();
-    return data.tracks.find((track) => track.id === data.activeTrackId) ?? data.tracks[0];
+    return data.tracks.find((track) => track.id === activeTab()) ?? data.tracks[0];
   });
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
+
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
@@ -142,25 +169,45 @@ export default function OralHistoryEditor() {
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
 
+  const conflictList = createMemo(() => {
+    const map = conflicts();
+    return Object.keys(map)
+      .sort()
+      .map((key) => map[key])
+      .filter((entry): entry is FieldConflict => Boolean(entry));
+  });
+  const conflictTrackCount = createMemo(() => {
+    const set = new Set<string>();
+    for (const item of conflictList()) set.add(item.trackId);
+    return set;
+  });
+  const segmentConflictCount = (trackId: string, segmentId: string) =>
+    conflictList().filter((item) => item.trackId === trackId && item.segmentId === segmentId).length;
+  const activeSegmentConflicts = createMemo(() =>
+    conflictList().filter((item) => item.trackId === activeTrack()?.id && item.segmentId === selectedId()));
+
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
-    const current = structuredClone(project());
-    const next = structuredClone(current);
-    mutate(next);
-    next.updatedAt = new Date().toISOString();
+    const current = project();
+    const before = structuredClone(current);
+    const draft = structuredClone(current);
+    mutate(draft);
+    draft.updatedAt = new Date().toISOString();
+    const stamped = stampLocalEdits(before, draft, TAB_ID, authorName());
     batch(() => {
-      setPast((items) => [...items.slice(-49), current]);
+      setPast((items) => [...items.slice(-49), before]);
       setFuture([]);
-      setProject(next);
+      setProject(stamped);
       setRevision((value) => value + 1);
       setLastAction(label);
     });
     dirty = true;
+    if (!online()) offlineEdits += 1;
   };
 
   const commitSegment = (label: string, mutate: (segment: Segment, draft: ProjectData) => void) => {
     const id = selectedId();
     commit(label, (draft) => {
-      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      const track = draft.tracks.find((item) => item.id === activeTab());
       const segment = track?.segments.find((item) => item.id === id);
       if (segment) mutate(segment, draft);
     });
@@ -176,6 +223,7 @@ export default function OralHistoryEditor() {
     setRevision((value) => value + 1);
     setLastAction("已撤销上一步");
     dirty = true;
+    if (!online()) offlineEdits += 1;
   };
 
   const redo = () => {
@@ -188,16 +236,14 @@ export default function OralHistoryEditor() {
     setRevision((value) => value + 1);
     setLastAction("已重做");
     dirty = true;
+    if (!online()) offlineEdits += 1;
   };
 
   const switchTrack = (trackId: string) => {
-    commit("切换文本轨", (draft) => {
-      draft.activeTrackId = trackId;
-      selectedIdSet(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
-    });
+    setActiveTab(trackId);
+    setSelectedId(project().tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
+    setLastAction("切换文本轨");
   };
-
-  const selectedIdSet = (id: string) => setSelectedId(id);
 
   const moveSelection = (direction: 1 | -1) => {
     const segments = activeTrack()?.segments ?? [];
@@ -223,7 +269,7 @@ export default function OralHistoryEditor() {
       const original = structuredClone(current);
       current.text = firstText;
       current.end = Number(boundary.toFixed(1));
-      const trackIndex = draft.tracks.findIndex((track) => track.id === draft.activeTrackId);
+      const trackIndex = draft.tracks.findIndex((track) => track.id === activeTab());
       if (trackIndex >= 0) {
         const segmentIndex = draft.tracks[trackIndex].segments.findIndex((item) => item.id === current.id);
         draft.tracks[trackIndex].segments.splice(segmentIndex + 1, 0, {
@@ -233,6 +279,7 @@ export default function OralHistoryEditor() {
           text: secondText,
           reviewed: false,
           comments: [],
+          meta: { fields: {}, reviewedAt: 0, reviewedBy: "", createdAt: Date.now() },
         });
       }
       setSelectedId(secondId);
@@ -252,7 +299,7 @@ export default function OralHistoryEditor() {
       current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
       current.comments.push(...next.comments);
       current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
-      const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      const sourceTrack = draft.tracks.find((item) => item.id === activeTab());
       sourceTrack?.segments.splice(index + 1, 1);
       current.reviewed = false;
     });
@@ -279,10 +326,11 @@ export default function OralHistoryEditor() {
     commitSegment("添加批注", (segment) => {
       segment.comments.unshift({
         id: uid("comment"),
-        author: "当前校对员",
+        author: authorName(),
         body,
         createdAt: new Date().toISOString(),
         resolved: false,
+        resolvedAt: 0,
         replies: [],
       });
       segment.reviewed = false;
@@ -297,7 +345,7 @@ export default function OralHistoryEditor() {
       const comment = segment.comments.find((item) => item.id === commentId);
       comment?.replies.push({
         id: uid("reply"),
-        author: "当前校对员",
+        author: authorName(),
         body,
         createdAt: new Date().toISOString(),
       });
@@ -308,7 +356,10 @@ export default function OralHistoryEditor() {
   const toggleComment = (commentId: string) => {
     commitSegment("更新批注状态", (segment) => {
       const comment = segment.comments.find((item) => item.id === commentId);
-      if (comment) comment.resolved = !comment.resolved;
+      if (comment) {
+        comment.resolved = !comment.resolved;
+        comment.resolvedAt = comment.resolved ? Date.now() : 0;
+      }
     });
   };
 
@@ -339,37 +390,131 @@ export default function OralHistoryEditor() {
     commit("导入转写文本", (draft) => {
       draft.tracks.push(imported);
       draft.activeTrackId = imported.id;
+      setActiveTab(imported.id);
       setSelectedId(imported.segments[0].id);
     });
   };
 
-  const resolveConflict = (useIncoming: boolean) => {
-    const incoming = conflict();
-    if (!incoming) return;
-    if (useIncoming) {
-      setPast((items) => [...items.slice(-49), structuredClone(project())]);
-      setProject(structuredClone(incoming.project));
-      setRevision(incoming.revision + 1);
-      setSelectedId(incoming.project.tracks.find((track) => track.id === incoming.project.activeTrackId)?.segments[0]?.id ?? "");
-      setLastAction("已采用其他标签页的版本");
-      dirty = true;
-    } else {
-      setRevision((value) => value + 1);
-      setLastAction("已保留本页并覆盖冲突版本");
-      dirty = true;
+  /* ---------------------------------------------------------------- */
+  /* Cross-tab merge ingestion                                        */
+  /* ---------------------------------------------------------------- */
+
+  const ingestEnvelope = (incoming: PersistedEnvelope) => {
+    if (incoming.tabId === TAB_ID) return;
+    if (incoming.schema !== 2 || !incoming.project?.tracks?.length) return;
+    // Vector comparison — not the page-wide revision — decides what merges.
+
+    const before = project();
+    const { project: merged, conflicts: nextConflicts } = mergeProjects(
+      before,
+      incoming.project,
+      { tabId: TAB_ID, author: authorName() },
+      conflicts(),
+    );
+
+    const changed = !sameFieldValue(before, merged);
+    const conflictKeysBefore = Object.keys(conflicts()).sort().join("|");
+    const conflictKeysAfter = Object.keys(nextConflicts).sort().join("|");
+    if (!changed && conflictKeysBefore === conflictKeysAfter) return;
+
+    const resolvedAway = conflictKeysBefore.split("|").filter((key) => key && !nextConflicts[key]).length;
+    const appeared = conflictKeysAfter.split("|").filter((key) => key && !conflicts()[key]).length;
+
+    batch(() => {
+      setProject(merged);
+      setConflicts(nextConflicts);
+      saveConflicts(TAB_ID, nextConflicts);
+      if (changed) {
+        if (appeared) setLastAction(`已自动合并「${incoming.author}」的修改，${appeared} 处字段待裁定`);
+        else if (resolvedAway) setLastAction(`已合并「${incoming.author}」的修改，${resolvedAway} 处冲突已解决`);
+        else setLastAction(`已自动合并「${incoming.author}」在其他片段的修改`);
+      }
+    });
+
+    // Persist the merged result immediately so a third tab converges too.
+    window.clearTimeout(saveTimer);
+    const envelope = saveProject(merged, revision() + 1, TAB_ID, authorName());
+    setSaveStatus(online() ? "saved" : "offline");
+    channel?.postMessage(envelope);
+  };
+
+  const pickConflict = (key: string, candidateIndex: number) => {
+    setChoices((current) => ({ ...current, [key]: candidateIndex }));
+  };
+
+  const pickAllForSegment = (items: FieldConflict[], candidateIndex: number) => {
+    setChoices((current) => {
+      const next = { ...current };
+      for (const item of items) {
+        const max = item.candidates.length - 1;
+        next[conflictKey(item.trackId, item.segmentId, item.field)] = Math.min(candidateIndex, max);
+      }
+      return next;
+    });
+  };
+
+  const applyChoices = (items: FieldConflict[]) => {
+    const unresolved = items.filter(
+      (item) => choices()[conflictKey(item.trackId, item.segmentId, item.field)] === undefined,
+    );
+    if (unresolved.length) {
+      setLastAction(`还有 ${unresolved.length} 处未选择，请逐项裁定`);
+      return;
     }
-    setConflict(null);
+    const selected = items.map((item) => ({
+      conflict: item,
+      candidateIndex: choices()[conflictKey(item.trackId, item.segmentId, item.field)],
+    }));
+    const nextProject = applyConflictChoices(project(), selected, TAB_ID);
+    const removedKeys = new Set(items.map((item) => conflictKey(item.trackId, item.segmentId, item.field)));
+    const remaining: ConflictMap = {};
+    for (const [key, value] of Object.entries(conflicts())) {
+      if (!removedKeys.has(key)) remaining[key] = value;
+    }
+    batch(() => {
+      setPast((list) => [...list.slice(-49), structuredClone(project())]);
+      setProject(nextProject);
+      setRevision((value) => value + 1);
+      setConflicts(remaining);
+      setChoices((current) => {
+        const next = { ...current };
+        removedKeys.forEach((key) => delete next[key]);
+        return next;
+      });
+      setLastAction(`已按逐项选择解决 ${selected.length} 处字段差异`);
+    });
+    saveConflicts(TAB_ID, remaining);
+    dirty = true;
+    if (!online()) offlineEdits += 1;
+    window.clearTimeout(saveTimer);
+    const envelope = saveProject(nextProject, revision(), TAB_ID, authorName());
+    setSaveStatus(online() ? "saved" : "offline");
+    channel?.postMessage(envelope);
   };
 
   onMount(() => {
     hydrated = true;
-    const handleOnline = () => setOnline(true);
-    const handleOffline = () => setOnline(false);
+    const handleOnline = () => {
+      setOnline(true);
+      setSaveStatus("saving");
+      // Re-submit edits made while offline and ask other tabs to resync.
+      const envelope = saveProject(project(), revision(), TAB_ID, authorName());
+      channel?.postMessage(envelope);
+      channel?.postMessage({ type: "sync-request", from: TAB_ID, author: authorName() });
+      setPendingCount(0);
+      offlineEdits = 0;
+      setLastAction("网络已恢复，离线修改已提交并重新同步");
+      setSaveStatus("saved");
+    };
+    const handleOffline = () => {
+      setOnline(false);
+      setSaveStatus("offline");
+    };
     const handleStorage = (event: StorageEvent) => {
       if (event.key !== "sologsb-1007-project-v1" || !event.newValue) return;
       try {
         const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
-        if (incoming.tabId !== TAB_ID && incoming.revision > revision()) setConflict(incoming);
+        ingestEnvelope(incoming);
       } catch {
         // Ignore unrelated or malformed storage events.
       }
@@ -385,10 +530,12 @@ export default function OralHistoryEditor() {
       }
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        const envelope = saveProject(project(), revision(), TAB_ID);
-        setSaveStatus("saved");
-        setLastAction("已保存本地草稿");
+        window.clearTimeout(saveTimer);
+        const envelope = saveProject(project(), revision(), TAB_ID, authorName());
+        setSaveStatus(online() ? "saved" : "offline");
+        setLastAction(online() ? "已保存本地草稿" : "已写入离线草稿，联网后提交");
         channel?.postMessage(envelope);
+        dirty = false;
         return;
       }
       if (editing) return;
@@ -414,6 +561,7 @@ export default function OralHistoryEditor() {
     window.addEventListener("storage", handleStorage);
     window.addEventListener("keydown", handleKeydown);
     setOnline(navigator.onLine);
+    setSaveStatus(navigator.onLine ? "saved" : "offline");
     onCleanup(() => {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
@@ -422,8 +570,18 @@ export default function OralHistoryEditor() {
     });
   });
 
-  channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope>) => {
-    if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
+  channel?.addEventListener("message", (event: MessageEvent) => {
+    const data = event.data as PersistedEnvelope | { type?: string; from?: string };
+    if (data && typeof data === "object" && "type" in data && data.type === "sync-request") {
+      // Another tab came back online; resend our latest envelope.
+      if ((data as { from?: string }).from !== TAB_ID) {
+        window.clearTimeout(saveTimer);
+        const envelope = saveProject(project(), revision(), TAB_ID, authorName());
+        channel?.postMessage(envelope);
+      }
+      return;
+    }
+    ingestEnvelope(data as PersistedEnvelope);
   });
 
   createEffect(() => {
@@ -431,11 +589,12 @@ export default function OralHistoryEditor() {
     const currentRevision = revision();
     if (!hydrated) return;
     setSaveStatus(online() ? "saving" : "offline");
+    if (!online()) setPendingCount(offlineEdits);
     window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
-      const envelope = saveProject(current, currentRevision, TAB_ID);
+      const envelope = saveProject(current, currentRevision, TAB_ID, authorName());
       setSaveStatus(online() ? "saved" : "offline");
-      if (dirty) {
+      if (online() && dirty) {
         channel?.postMessage(envelope);
         dirty = false;
       }
@@ -452,23 +611,68 @@ export default function OralHistoryEditor() {
     queueMicrotask(() => editorRef?.focus());
   };
 
+  const commitAuthor = () => {
+    const trimmed = authorName().trim() || "校对员";
+    setAuthorName(trimmed);
+    setAuthor(trimmed);
+    setLastAction("校对员身份已更新，后续修改会以此署名");
+  };
+
+  /* ---------------------------------------------------------------- */
+  /* Conflict value rendering                                         */
+  /* ---------------------------------------------------------------- */
+
+  const speakerName = (id: string) => project().speakers.find((speaker) => speaker.id === id)?.name ?? id;
+  const tagLabels = (ids: unknown) =>
+    Array.isArray(ids) && ids.length
+      ? (ids as string[]).map((id) => tagById(id)?.label ?? id).join("、")
+      : "（无关联）";
+
+  const candidateText = (candidate: ConflictCandidate, field: FieldKey): string => {
+    const value = candidate.value;
+    if (field === "text") return String(value ?? "");
+    if (field === "speakerId") return speakerName(String(value));
+    if (field === "start" || field === "end") return formatTime(Number(value));
+    if (field === "confidence") return `${value} / 5`;
+    if (field === "flags") {
+      const flags = value as Segment["flags"];
+      const parts: string[] = [];
+      if (flags?.lowConfidence) parts.push("低置信词句");
+      if (flags?.dialect) parts.push("方言表达");
+      if (flags?.properNoun) parts.push("专有名词");
+      return parts.length ? parts.join("、") : "无标记";
+    }
+    return tagLabels(value);
+  };
+
+  const isLocalCandidate = (candidate: ConflictCandidate) => candidate.tabId === TAB_ID;
+  const candidateSource = (candidate: ConflictCandidate, index: number) =>
+    isLocalCandidate(candidate) ? "本页修改" : candidate.author || `标签页 ${candidate.tabId.slice(-4)}`;
+
   return (
     <div class="app-shell">
-      <Show when={conflict()}>
-        {(incoming) => (
-          <div class="conflict-banner" role="alert">
-            <div>
-              <strong>检测到另一个标签页修改了同一草稿</strong>
-              <span>
-                对方版本保存于 {new Date(incoming().savedAt).toLocaleTimeString()}。为避免静默覆盖，请选择要保留的版本。
-              </span>
-            </div>
-            <div class="conflict-actions">
-              <button class="btn btn-quiet" onClick={() => resolveConflict(false)}>保留本页</button>
-              <button class="btn btn-danger" onClick={() => resolveConflict(true)}>载入对方版本</button>
-            </div>
+      <Show when={conflictList().length}>
+        <div class="conflict-banner" role="alert">
+          <div>
+            <strong>{conflictList().length} 处同片段字段差异待裁定</strong>
+            <span>不同片段的修改已自动合并；同一片段的冲突保留了双方版本，请到片段右侧逐项选择，批注与回复均已保留。</span>
           </div>
-        )}
+          <div class="conflict-actions">
+            <button class="btn btn-quiet" onClick={() => {
+              const first = conflictList()[0];
+              setActiveTab(first.trackId);
+              setSelectedId(first.segmentId);
+              document.getElementById(`segment-${first.segmentId}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+            }}>前往处理</button>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={!online() && pendingCount() > 0}>
+        <div class="offline-banner" role="status">
+          <strong>离线中：{pendingCount()} 处修改已存入本地</strong>
+          <span>恢复网络后会自动提交，并与其他校对员的片段自动合并。</span>
+        </div>
       </Show>
 
       <header class="topbar">
@@ -486,6 +690,14 @@ export default function OralHistoryEditor() {
           </div>
         </div>
         <div class="top-actions">
+          <input
+            class="author-input"
+            aria-label="校对员署名"
+            value={authorName()}
+            onInput={(event) => setAuthorName(event.currentTarget.value)}
+            onChange={commitAuthor}
+            title="修改会以该署名记录来源与时间"
+          />
           <span class={`network-chip ${online() ? "online" : "offline"}`}>{online() ? "在线" : "离线可编辑"}</span>
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
@@ -503,7 +715,7 @@ export default function OralHistoryEditor() {
               <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <p>按片段自动保存来源、时间与版本；不同片段的修改直接合并，不再整页拦截。</p>
           </section>
 
           <section class="panel-section">
@@ -511,10 +723,15 @@ export default function OralHistoryEditor() {
             <div class="track-list">
               <For each={project().tracks}>
                 {(track) => (
-                  <button class={`track-card ${track.id === project().activeTrackId ? "active" : ""}`} onClick={() => switchTrack(track.id)}>
+                  <button class={`track-card ${track.id === activeTab() ? "active" : ""}`} onClick={() => switchTrack(track.id)}>
                     <span class="track-icon">{track.language === "English" ? "EN" : track.language === "福州话转写" ? "方" : "普"}</span>
                     <span class="track-info"><strong>{track.name}</strong><small>{track.segments.length} 段 · {track.status}</small></span>
-                    <span class="track-dot" style={{ background: track.status === "已完成" ? "#15803d" : track.status === "校对中" ? "#d97706" : "#94a3b8" }} />
+                    <span class="track-dot-wrap">
+                      <Show when={conflictTrackCount().has(track.id)}>
+                        <i class="track-conflict-badge">{conflictList().filter((item) => item.trackId === track.id).length}</i>
+                      </Show>
+                      <span class="track-dot" style={{ background: track.status === "已完成" ? "#15803d" : track.status === "校对中" ? "#d97706" : "#94a3b8" }} />
+                    </span>
                   </button>
                 )}
               </For>
@@ -535,13 +752,29 @@ export default function OralHistoryEditor() {
           </section>
 
           <section class="panel-section tag-summary">
-            <div class="section-title"><h2>标注实体</h2><span>{project().tags.length}</span></div>
-            <div class="legend">
-              <span><i style={{ background: "#2563eb" }} />主题</span>
-              <span><i style={{ background: "#b45309" }} />事件</span>
-              <span><i style={{ background: "#be185d" }} />人物</span>
-            </div>
-            <p>在右侧“标注”页把当前片段关联到主题、事件和人物。</p>
+            <div class="section-title"><h2>待裁定差异</h2><span>{conflictList().length}</span></div>
+            <Show when={conflictList().length} fallback={<p>暂无同片段冲突。其他标签页修改不同片段时会静默合并。</p>}>
+              <div class="conflict-jump-list">
+                <For each={conflictList()}>
+                  {(item) => {
+                    const track = project().tracks.find((t) => t.id === item.trackId);
+                    return (
+                      <button
+                        class="conflict-jump"
+                        classList={{ current: item.trackId === activeTrack()?.id && item.segmentId === selectedId() }}
+                        onClick={() => {
+                          setActiveTab(item.trackId);
+                          setSelectedId(item.segmentId);
+                        }}
+                      >
+                        <b>{FIELD_LABELS[item.field]}</b>
+                        <span>{track?.name} · {item.candidates.length} 个版本</span>
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
           </section>
         </aside>
 
@@ -560,38 +793,47 @@ export default function OralHistoryEditor() {
 
           <div class="transcript-list" role="listbox" aria-label="转写片段">
             <For each={visibleSegments()}>
-              {(segment, index) => (
-                <article
-                  id={`segment-${segment.id}`}
-                  role="option"
-                  aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
-                  onClick={() => clickSegment(segment.id)}
-                >
-                  <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
-                  <div class="segment-time">
-                    <span>{formatTime(segment.start, false)}</span>
-                    <small>{formatTime(segment.end, false)}</small>
-                  </div>
-                  <div class="segment-body">
-                    <div class="segment-meta">
-                      <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
-                      <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
-                      <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
-                      <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
-                      <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
-                      <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+              {(segment, index) => {
+                const conflictCount = () => segmentConflictCount(activeTrack().id, segment.id);
+                return (
+                  <article
+                    id={`segment-${segment.id}`}
+                    role="option"
+                    aria-selected={segment.id === selectedId()}
+                    class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""} ${conflictCount() ? "has-conflict" : ""}`}
+                    onClick={() => clickSegment(segment.id)}
+                  >
+                    <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
+                    <div class="segment-time">
+                      <span>{formatTime(segment.start, false)}</span>
+                      <small>{formatTime(segment.end, false)}</small>
                     </div>
-                    <p>{segment.text}</p>
-                    <div class="segment-tags">
-                      <For each={segment.tagIds.map(tagById).filter(Boolean)}>
-                        {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
-                      </For>
+                    <div class="segment-body">
+                      <div class="segment-meta">
+                        <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
+                        <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
+                        <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
+                        <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
+                        <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
+                        <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                        <Show when={conflictCount()}>
+                          <span class="pill conflict-pill">⚠ {conflictCount()} 处待裁定</span>
+                        </Show>
+                      </div>
+                      <p>{segment.text}</p>
+                      <div class="segment-tags">
+                        <For each={segment.tagIds.map(tagById).filter(Boolean)}>
+                          {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
+                        </For>
+                      </div>
+                      <Show when={segment.comments.length}>
+                        <div class="segment-comment-hint">批注 {segment.comments.length} · 回复 {segment.comments.reduce((sum, comment) => sum + comment.replies.length, 0)}</div>
+                      </Show>
                     </div>
-                  </div>
-                  <span class="segment-index">{index() + 1}</span>
-                </article>
-              )}
+                    <span class="segment-index">{index() + 1}</span>
+                  </article>
+                );
+              }}
             </For>
             <Show when={!visibleSegments().length}>
               <div class="empty-state"><b>没有符合筛选条件的片段</b><span>切换到“全部”继续校对。</span></div>
@@ -610,6 +852,25 @@ export default function OralHistoryEditor() {
                 </Tabs.List>
 
                 <Tabs.Content value="correct" class="tab-content">
+                  <For each={activeSegmentConflicts()}>
+                    {(item) => (
+                      <ConflictCard
+                        item={item}
+                        selectedIndex={choices()[conflictKey(item.trackId, item.segmentId, item.field)]}
+                        onPick={(candidateIndex) => pickConflict(conflictKey(item.trackId, item.segmentId, item.field), candidateIndex)}
+                        candidateText={(candidate) => candidateText(candidate, item.field)}
+                        candidateSource={candidateSource}
+                        isLocal={isLocalCandidate}
+                      />
+                    )}
+                  </For>
+                  <Show when={activeSegmentConflicts().length}>
+                    <div class="conflict-bulk">
+                      <button class="btn btn-quiet" onClick={() => pickAllForSegment(activeSegmentConflicts(), 0)}>全选本页版本</button>
+                      <button class="btn btn-primary" onClick={() => applyChoices(activeSegmentConflicts())}>应用本片段选择</button>
+                    </div>
+                  </Show>
+
                   <div class="inspector-heading">
                     <div><span>片段 {activeTrack().segments.findIndex((item) => item.id === segment().id) + 1}</span><strong>{formatTime(segment().start, false)} — {formatTime(segment().end, false)}</strong></div>
                     <button class={`review-button ${segment().reviewed ? "done" : ""}`} onClick={() => commitSegment("标记片段已校对", (item) => { item.reviewed = true; })}>
@@ -625,11 +886,14 @@ export default function OralHistoryEditor() {
                   >
                     <For each={project().speakers}>{(speaker) => <option value={speaker.id}>{speaker.name} · {speaker.role}</option>}</For>
                   </select>
+                  <FieldProvenance segment={segment()} field="speakerId" />
 
                   <div class="time-grid">
                     <label>开始<input type="text" value={formatTime(segment().start)} onChange={(event) => commitSegment("修改开始时间", (item) => { item.start = parseTime(event.currentTarget.value); })} /></label>
                     <label>结束<input type="text" value={formatTime(segment().end)} onChange={(event) => commitSegment("修改结束时间", (item) => { item.end = parseTime(event.currentTarget.value); })} /></label>
                   </div>
+                  <FieldProvenance segment={segment()} field="start" />
+                  <FieldProvenance segment={segment()} field="end" />
 
                   <label class="field-label" for="transcript-editor">转写文本</label>
                   <textarea
@@ -639,6 +903,7 @@ export default function OralHistoryEditor() {
                     value={segment().text}
                     onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
                   />
+                  <FieldProvenance segment={segment()} field="text" />
                   <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
 
                   <div class="field-label">置信度</div>
@@ -647,6 +912,7 @@ export default function OralHistoryEditor() {
                       {(value) => <button class={segment().confidence === value ? "active" : ""} onClick={() => setConfidence(value)}>{value}</button>}
                     </For>
                   </div>
+                  <FieldProvenance segment={segment()} field="confidence" />
 
                   <div class="field-label">校对标记</div>
                   <div class="flag-list">
@@ -666,6 +932,7 @@ export default function OralHistoryEditor() {
                       <Checkbox.Label>专有名词</Checkbox.Label>
                     </Checkbox>
                   </div>
+                  <FieldProvenance segment={segment()} field="flags" />
 
                   <div class="split-actions">
                     <button onClick={splitSelection}>⌁ 按光标拆分</button>
@@ -674,7 +941,25 @@ export default function OralHistoryEditor() {
                 </Tabs.Content>
 
                 <Tabs.Content value="annotate" class="tab-content">
-                  <div class="content-title"><h3>关联主题、事件与人物</h3><p>一个片段可关联多个实体，复核后颜色会显示在列表中。</p></div>
+                  <For each={activeSegmentConflicts()}>
+                    {(item) => (
+                      <ConflictCard
+                        item={item}
+                        selectedIndex={choices()[conflictKey(item.trackId, item.segmentId, item.field)]}
+                        onPick={(candidateIndex) => pickConflict(conflictKey(item.trackId, item.segmentId, item.field), candidateIndex)}
+                        candidateText={(candidate) => candidateText(candidate, item.field)}
+                        candidateSource={candidateSource}
+                        isLocal={isLocalCandidate}
+                      />
+                    )}
+                  </For>
+                  <Show when={activeSegmentConflicts().length}>
+                    <div class="conflict-bulk">
+                      <button class="btn btn-quiet" onClick={() => pickAllForSegment(activeSegmentConflicts(), 0)}>全选本页版本</button>
+                      <button class="btn btn-primary" onClick={() => applyChoices(activeSegmentConflicts())}>应用本片段选择</button>
+                    </div>
+                  </Show>
+                  <div class="content-title"><h3>关联主题、事件与人物</h3><p>一个片段可关联多个实体；同一片段的关联若被两边同时改动，会保留两版供选择。</p></div>
                   <For each={project().tags}>
                     {(tag) => (
                       <button class={`tag-option ${segment().tagIds.includes(tag.id) ? "selected" : ""}`} onClick={() => toggleTag(tag.id)}>
@@ -684,10 +969,11 @@ export default function OralHistoryEditor() {
                       </button>
                     )}
                   </For>
+                  <FieldProvenance segment={segment()} field="tagIds" />
                 </Tabs.Content>
 
                 <Tabs.Content value="comments" class="tab-content comments-content">
-                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论。</p></div>
+                  <div class="content-title"><h3>批注与回复</h3><p>批注按原片段随合并保留，多人回复按条目并集，绝不丢失。</p></div>
                   <div class="comment-compose">
                     <textarea rows="3" placeholder="记录读音、词义或专名依据…" value={commentDraft()} onInput={(event) => setCommentDraft(event.currentTarget.value)} />
                     <button class="btn btn-primary" onClick={addComment}>添加批注</button>
@@ -722,7 +1008,7 @@ export default function OralHistoryEditor() {
 
       <footer class="statusbar">
         <span>最近操作：{lastAction()}</span>
-        <span>版本 {revision() + 1} · 本地草稿</span>
+        <span>版本 {revision() + 1} · 片段级合并{conflictList().length ? ` · 待裁定 ${conflictList().length}` : ""}</span>
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
 
@@ -747,5 +1033,87 @@ export default function OralHistoryEditor() {
         </Dialog.Portal>
       </Dialog>
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Small components                                                   */
+/* ------------------------------------------------------------------ */
+
+function FieldProvenance(props: { segment: Segment; field: FieldKey }) {
+  const meta = () => props.segment.meta?.fields[props.field];
+  const tabTag = (tabId: string) => {
+    if (tabId === TAB_ID) return "本页";
+    if (tabId === "legacy-draft") return "旧草稿";
+    if (tabId === "seed-project") return "示例";
+    return `标签页 ${tabId.slice(-4)}`;
+  };
+  return (
+    <Show when={meta()}>
+      {(m) => (
+        <div class="field-provenance">
+          来源：{m().originAuthor || "未知校对员"}（{tabTag(m().originTab)}） · {new Date(m().updatedAt).toLocaleString()}
+        </div>
+      )}
+    </Show>
+  );
+}
+
+function ConflictCard(props: {
+  item: FieldConflict;
+  selectedIndex: number | undefined;
+  onPick: (candidateIndex: number) => void;
+  candidateText: (candidate: ConflictCandidate) => string;
+  candidateSource: (candidate: ConflictCandidate, index: number) => string;
+  isLocal: (candidate: ConflictCandidate) => boolean;
+}) {
+  const diffParts = createMemo(() => {
+    if (props.item.field !== "text" || props.item.candidates.length < 2) return null;
+    return charDiff(props.candidateText(props.item.candidates[0]), props.candidateText(props.item.candidates[1]));
+  });
+  return (
+    <section class="conflict-card" role="group" aria-label={`${FIELD_LABELS[props.item.field]}冲突`}>
+      <header>
+        <b>{FIELD_LABELS[props.item.field]}存在差异</b>
+        <small>{props.item.candidates.length} 个版本 · 请逐项选择</small>
+      </header>
+      <For each={props.item.candidates}>
+        {(candidate, index) => {
+          const selected = () => props.selectedIndex === index();
+          return (
+            <button
+              class={`conflict-option ${selected() ? "selected" : ""} ${props.isLocal(candidate) ? "local" : "remote"}`}
+              onClick={() => props.onPick(index())}
+              aria-pressed={selected()}
+            >
+              <span class="conflict-option-head">
+                <i class="conflict-radio" aria-hidden="true" />
+                <b>{props.candidateSource(candidate, index())}</b>
+                <time>{new Date(candidate.updatedAt).toLocaleString()}</time>
+              </span>
+              <Show
+                when={diffParts() && index() <= 1}
+                fallback={<span class="conflict-value">{props.candidateText(candidate)}</span>}
+              >
+                <span class="conflict-diff">
+                  <For each={diffParts()!}>
+                    {(part) => (
+                      <span
+                        classList={{
+                          "diff-del": index() === 0 && part.local && !part.incoming,
+                          "diff-ins": index() === 1 && part.incoming && !part.local,
+                        }}
+                      >
+                        {part.text}
+                      </span>
+                    )}
+                  </For>
+                </span>
+              </Show>
+            </button>
+          );
+        }}
+      </For>
+    </section>
   );
 }

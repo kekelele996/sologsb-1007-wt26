@@ -1,5 +1,33 @@
 export type Confidence = 1 | 2 | 3 | 4 | 5;
 
+export type FieldKey =
+  | "text"
+  | "speakerId"
+  | "start"
+  | "end"
+  | "confidence"
+  | "flags"
+  | "tagIds";
+
+/** Per-tab counter vector used to order concurrent field edits. */
+export type VersionVector = Record<string, number>;
+
+export interface FieldMeta {
+  vector: VersionVector;
+  /** Tab id that produced the current value. */
+  originTab: string;
+  /** Proofreader name captured when the value was written. */
+  originAuthor: string;
+  updatedAt: number;
+}
+
+export interface SegmentMeta {
+  fields: Partial<Record<FieldKey, FieldMeta>>;
+  reviewedAt: number;
+  reviewedBy: string;
+  createdAt: number;
+}
+
 export interface Reply {
   id: string;
   author: string;
@@ -13,6 +41,8 @@ export interface ReviewComment {
   body: string;
   createdAt: string;
   resolved: boolean;
+  /** Epoch ms of the last resolve/reopen action; 0 for legacy drafts. */
+  resolvedAt?: number;
   replies: Reply[];
 }
 
@@ -45,6 +75,7 @@ export interface Segment {
   };
   tagIds: string[];
   comments: ReviewComment[];
+  meta: SegmentMeta;
 }
 
 export interface TranscriptTrack {
@@ -68,9 +99,40 @@ export interface ProjectData {
 }
 
 export interface PersistedEnvelope {
+  schema: 2;
+  revision: number;
+  tabId: string;
+  author: string;
+  savedAt: number;
+  project: ProjectData;
+}
+
+/** Old whole-page envelope; accepted once and migrated on open. */
+export interface LegacyEnvelope {
   schema: 1;
   revision: number;
   tabId: string;
   savedAt: number;
   project: ProjectData;
 }
+
+export interface ConflictCandidate {
+  tabId: string;
+  author: string;
+  updatedAt: number;
+  value: unknown;
+  vector: VersionVector;
+}
+
+export interface FieldConflict {
+  trackId: string;
+  segmentId: string;
+  field: FieldKey;
+  /** Local candidate is always first; further candidates come from other tabs. */
+  candidates: ConflictCandidate[];
+}
+
+export type ConflictMap = Record<string, FieldConflict>;
+
+export const conflictKey = (trackId: string, segmentId: string, field: FieldKey) =>
+  `${trackId}/${segmentId}/${field}`;

@@ -1,4 +1,5 @@
-import type { Confidence, ProjectData, Segment, Tag } from "./types";
+import type { Confidence, FieldKey, ProjectData, Segment, SegmentMeta, Tag } from "./types";
+import { MERGE_FIELDS } from "./merge";
 
 export const uid = (prefix = "id") =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -8,6 +9,26 @@ export const makeTag = (label: string, type: Tag["type"], color: string): Tag =>
   label,
   type,
   color,
+});
+
+const SEED_TAB = "seed-project";
+const SEED_TIME = Date.parse("2026-08-18T09:00:00.000Z");
+
+const seedMeta = (): SegmentMeta => ({
+  fields: Object.fromEntries(
+    MERGE_FIELDS.map((field: FieldKey) => [
+      field,
+      {
+        vector: { [SEED_TAB]: 1 },
+        originTab: SEED_TAB,
+        originAuthor: "示例数据",
+        updatedAt: SEED_TIME,
+      },
+    ]),
+  ) as SegmentMeta["fields"],
+  reviewedAt: 0,
+  reviewedBy: "",
+  createdAt: SEED_TIME,
 });
 
 const segment = (
@@ -36,6 +57,7 @@ const segment = (
   },
   tagIds,
   comments: [],
+  meta: seedMeta(),
 });
 
 export const createSeedProject = (): ProjectData => {
