@@ -10,14 +10,40 @@ import {
   createSignal,
   onCleanup,
   onMount,
-  untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import { createMeta, uid } from "../data";
+import {
+  STORAGE_KEY,
+  applyFieldValue,
+  downloadText,
+  formatTime,
+  loadProject,
+  mergeProjects,
+  parseTime,
+  saveProject,
+} from "../persistence";
+import type {
+  Confidence,
+  ConflictField,
+  FieldConflict,
+  PersistedEnvelope,
+  ProjectData,
+  Segment,
+  SegmentMeta,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
+
+const FIELD_LABELS: Record<ConflictField, string> = {
+  text: "正文",
+  speakerId: "发言人",
+  timecode: "时间码",
+  confidence: "置信度",
+  flags: "标记",
+  tagIds: "关联",
+};
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -50,6 +76,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         flags: { lowConfidence: false, dialect: false, properNoun: false },
         tagIds: [],
         comments: [],
+        meta: createMeta(TAB_ID),
       });
       continue;
     }
@@ -70,6 +97,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         flags: { lowConfidence: false, dialect: false, properNoun: false },
         tagIds: [],
         comments: [],
+        meta: createMeta(TAB_ID),
       });
     }
   }
@@ -87,6 +115,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         flags: { lowConfidence: false, dialect: false, properNoun: false },
         tagIds: [],
         comments: [],
+        meta: createMeta(TAB_ID),
       });
     });
   }
@@ -109,7 +138,8 @@ export default function OralHistoryEditor() {
   const [selectedId, setSelectedId] = createSignal(loaded.project.tracks[0]?.segments[0]?.id ?? "");
   const [saveStatus, setSaveStatus] = createSignal<"saved" | "saving" | "offline">("saved");
   const [lastAction, setLastAction] = createSignal("示例项目已就绪");
-  const [conflict, setConflict] = createSignal<PersistedEnvelope | null>(null);
+  const [conflicts, setConflicts] = createSignal<FieldConflict[]>([]);
+  const [pendingSync, setPendingSync] = createSignal(loaded.pendingSync);
   const [online, setOnline] = createSignal(true);
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
@@ -119,7 +149,9 @@ export default function OralHistoryEditor() {
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
-  let dirty = false;
+  // 本页最近共同看到的共享草稿，作为三方合并的 base；离线未提交的修改进入待提交队列。
+  let baseProject = structuredClone(loaded.project);
+  let dirty = loaded.pendingSync;
 
   const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(CHANNEL_NAME) : null;
   const activeTrack = createMemo(() => {
@@ -142,16 +174,32 @@ export default function OralHistoryEditor() {
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
 
+  /** 自动保存按片段记录来源标签页、修改时间和版本。 */
+  const stampSegmentMeta = (before: ProjectData, after: ProjectData, version: number) => {
+    const now = Date.now();
+    for (const track of after.tracks) {
+      const prevTrack = before.tracks.find((item) => item.id === track.id);
+      for (const segment of track.segments) {
+        const prev = prevTrack?.segments.find((item) => item.id === segment.id);
+        if (!prev || JSON.stringify(prev) !== JSON.stringify(segment)) {
+          segment.meta = { tabId: TAB_ID, editedAt: now, version };
+        }
+      }
+    }
+  };
+
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
     const next = structuredClone(current);
     mutate(next);
     next.updatedAt = new Date().toISOString();
+    const nextRevision = revision() + 1;
+    stampSegmentMeta(current, next, nextRevision);
     batch(() => {
       setPast((items) => [...items.slice(-49), current]);
       setFuture([]);
       setProject(next);
-      setRevision((value) => value + 1);
+      setRevision(nextRevision);
       setLastAction(label);
     });
     dirty = true;
@@ -343,33 +391,124 @@ export default function OralHistoryEditor() {
     });
   };
 
-  const resolveConflict = (useIncoming: boolean) => {
-    const incoming = conflict();
-    if (!incoming) return;
-    if (useIncoming) {
-      setPast((items) => [...items.slice(-49), structuredClone(project())]);
-      setProject(structuredClone(incoming.project));
-      setRevision(incoming.revision + 1);
-      setSelectedId(incoming.project.tracks.find((track) => track.id === incoming.project.activeTrackId)?.segments[0]?.id ?? "");
-      setLastAction("已采用其他标签页的版本");
-      dirty = true;
-    } else {
-      setRevision((value) => value + 1);
-      setLastAction("已保留本页并覆盖冲突版本");
-      dirty = true;
+  /** 忽略 updatedAt 比较两个项目内容是否一致，避免合并回环。 */
+  const sameProject = (a: ProjectData, b: ProjectData) =>
+    JSON.stringify({ ...a, updatedAt: "" }) === JSON.stringify({ ...b, updatedAt: "" });
+
+  /**
+   * 收到另一标签页的保存：以双方最近共同草稿为 base 做三方合并。
+   * 不同片段直接合并；同一片段同一字段两版不一致时保留两版，逐项交给校对员选择。
+   */
+  const handleIncoming = (incoming: PersistedEnvelope) => {
+    if (!incoming?.project?.tracks || incoming.tabId === TAB_ID) return;
+    if (sameProject(incoming.project, baseProject)) {
+      if (incoming.revision > revision()) setRevision(incoming.revision);
+      return;
     }
-    setConflict(null);
+    const local = project();
+    const { merged, conflicts: found } = mergeProjects(baseProject, local, incoming.project);
+    baseProject = structuredClone(incoming.project);
+    if (sameProject(merged, local) && !found.length) {
+      if (incoming.revision > revision()) setRevision(incoming.revision);
+      return;
+    }
+    setPast((items) => [...items.slice(-49), structuredClone(local)]);
+    setFuture([]);
+    setProject(merged);
+    setRevision(Math.max(revision(), incoming.revision) + 1);
+    setConflicts(found);
+    setLastAction(
+      found.length
+        ? `已合并另一标签页的修改，${found.length} 处字段冲突待逐项选择`
+        : "已自动合并另一标签页修改的不同片段",
+    );
+    dirty = true;
+  };
+
+  const applyConflict = (items: FieldConflict[], choice: "local" | "incoming") => {
+    commit(choice === "local" ? "冲突字段保留本页版本" : "冲突字段采用对方版本", (draft) => {
+      for (const item of items) {
+        const segment = draft.tracks
+          .find((track) => track.id === item.trackId)
+          ?.segments.find((item2) => item2.id === item.segmentId);
+        if (segment) applyFieldValue(segment, item.field, choice === "local" ? item.localValue : item.incomingValue);
+      }
+    });
+  };
+
+  const resolveField = (index: number, choice: "local" | "incoming") => {
+    const item = conflicts()[index];
+    if (!item) return;
+    applyConflict([item], choice);
+    setConflicts((list) => list.filter((_, i) => i !== index));
+  };
+
+  const resolveAll = (choice: "local" | "incoming") => {
+    const items = conflicts();
+    if (!items.length) return;
+    applyConflict(items, choice);
+    setConflicts([]);
+  };
+
+  const describeValue = (field: ConflictField, value: unknown): string => {
+    switch (field) {
+      case "text":
+        return String(value);
+      case "speakerId":
+        return project().speakers.find((speaker) => speaker.id === value)?.name ?? String(value);
+      case "timecode": {
+        const [start, end] = value as [number, number];
+        return `${formatTime(start)} → ${formatTime(end)}`;
+      }
+      case "confidence":
+        return `${value}/5`;
+      case "flags": {
+        const flags = value as Segment["flags"];
+        const labels = [
+          flags.lowConfidence && "低置信",
+          flags.dialect && "方言",
+          flags.properNoun && "专名",
+        ].filter(Boolean);
+        return labels.length ? labels.join("、") : "无标记";
+      }
+      case "tagIds": {
+        const labels = (value as string[]).map((id) => `#${project().tags.find((tag) => tag.id === id)?.label ?? id}`);
+        return labels.length ? labels.join(" ") : "无关联";
+      }
+    }
+  };
+
+  const metaLabel = (meta: SegmentMeta) =>
+    `${meta.tabId === TAB_ID ? "本标签页" : meta.tabId} · ${meta.editedAt ? new Date(meta.editedAt).toLocaleTimeString() : "—"} · v${meta.version}`;
+
+  const conflictContext = (item: FieldConflict) => {
+    const track = project().tracks.find((item2) => item2.id === item.trackId);
+    const index = track?.segments.findIndex((segment) => segment.id === item.segmentId) ?? -1;
+    return `${track?.name ?? "未知轨道"} · 片段 ${index >= 0 ? index + 1 : "?"}`;
+  };
+
+  /** 恢复网络（或手动点击）后提交离线期间的修改。 */
+  const submitPending = (reason: string) => {
+    const envelope = saveProject(project(), revision(), TAB_ID, false);
+    baseProject = structuredClone(project());
+    channel?.postMessage(envelope);
+    dirty = false;
+    setPendingSync(false);
+    setSaveStatus("saved");
+    setLastAction(reason);
   };
 
   onMount(() => {
     hydrated = true;
-    const handleOnline = () => setOnline(true);
+    const handleOnline = () => {
+      setOnline(true);
+      if (pendingSync() || dirty) submitPending("网络已恢复，离线期间的修改已提交");
+    };
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
-      if (event.key !== "sologsb-1007-project-v1" || !event.newValue) return;
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
       try {
-        const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
-        if (incoming.tabId !== TAB_ID && incoming.revision > revision()) setConflict(incoming);
+        handleIncoming(JSON.parse(event.newValue) as PersistedEnvelope);
       } catch {
         // Ignore unrelated or malformed storage events.
       }
@@ -385,10 +524,19 @@ export default function OralHistoryEditor() {
       }
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        const envelope = saveProject(project(), revision(), TAB_ID);
-        setSaveStatus("saved");
-        setLastAction("已保存本地草稿");
-        channel?.postMessage(envelope);
+        const envelope = saveProject(project(), revision(), TAB_ID, !online());
+        baseProject = structuredClone(project());
+        if (online()) {
+          if (dirty) channel?.postMessage(envelope);
+          dirty = false;
+          setPendingSync(false);
+          setSaveStatus("saved");
+          setLastAction("已保存本地草稿");
+        } else {
+          setPendingSync(true);
+          setSaveStatus("offline");
+          setLastAction("已保存离线草稿，恢复网络后自动提交");
+        }
         return;
       }
       if (editing) return;
@@ -423,21 +571,30 @@ export default function OralHistoryEditor() {
   });
 
   channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope>) => {
-    if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
+    handleIncoming(event.data);
   });
 
   createEffect(() => {
     const current = project();
     const currentRevision = revision();
     if (!hydrated) return;
-    setSaveStatus(online() ? "saving" : "offline");
+    const isOnline = online();
+    setSaveStatus(isOnline ? "saving" : "offline");
     window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
-      const envelope = saveProject(current, currentRevision, TAB_ID);
-      setSaveStatus(online() ? "saved" : "offline");
-      if (dirty) {
-        channel?.postMessage(envelope);
-        dirty = false;
+      const envelope = saveProject(current, currentRevision, TAB_ID, !isOnline);
+      baseProject = structuredClone(current);
+      if (isOnline) {
+        setSaveStatus("saved");
+        setPendingSync(false);
+        if (dirty) {
+          channel?.postMessage(envelope);
+          dirty = false;
+        }
+      } else {
+        // 断网期间继续改：草稿落盘并标记待提交，恢复网络后再提交。
+        setSaveStatus("offline");
+        setPendingSync(true);
       }
     }, 420);
   });
@@ -454,21 +611,43 @@ export default function OralHistoryEditor() {
 
   return (
     <div class="app-shell">
-      <Show when={conflict()}>
-        {(incoming) => (
-          <div class="conflict-banner" role="alert">
+      <Show when={conflicts().length > 0}>
+        <div class="conflict-panel" role="alert">
+          <div class="conflict-head">
             <div>
-              <strong>检测到另一个标签页修改了同一草稿</strong>
-              <span>
-                对方版本保存于 {new Date(incoming().savedAt).toLocaleTimeString()}。为避免静默覆盖，请选择要保留的版本。
-              </span>
+              <strong>同一片段被两个标签页修改</strong>
+              <span>不同片段的修改已自动合并；以下 {conflicts().length} 处字段两版不一致，请逐项选择保留哪一版。</span>
             </div>
-            <div class="conflict-actions">
-              <button class="btn btn-quiet" onClick={() => resolveConflict(false)}>保留本页</button>
-              <button class="btn btn-danger" onClick={() => resolveConflict(true)}>载入对方版本</button>
+            <div class="conflict-bulk">
+              <button class="btn btn-quiet" onClick={() => resolveAll("local")}>全部保留本页</button>
+              <button class="btn btn-danger" onClick={() => resolveAll("incoming")}>全部采用对方</button>
             </div>
           </div>
-        )}
+          <div class="conflict-list">
+            <For each={conflicts()}>
+              {(item, index) => (
+                <div class="conflict-item">
+                  <div class="conflict-context">
+                    <b>{conflictContext(item)}</b>
+                    <span>{FIELD_LABELS[item.field]}</span>
+                  </div>
+                  <div class="conflict-options">
+                    <button class="conflict-option" onClick={() => resolveField(index(), "local")}>
+                      <em>本页版本</em>
+                      <span>{describeValue(item.field, item.localValue)}</span>
+                      <small>{metaLabel(item.localMeta)}</small>
+                    </button>
+                    <button class="conflict-option incoming" onClick={() => resolveField(index(), "incoming")}>
+                      <em>对方版本</em>
+                      <span>{describeValue(item.field, item.incomingValue)}</span>
+                      <small>{metaLabel(item.incomingMeta)}</small>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
       </Show>
 
       <header class="topbar">
@@ -487,6 +666,12 @@ export default function OralHistoryEditor() {
         </div>
         <div class="top-actions">
           <span class={`network-chip ${online() ? "online" : "offline"}`}>{online() ? "在线" : "离线可编辑"}</span>
+          <Show when={pendingSync()}>
+            <span class="network-chip pending">{online() ? "有待提交修改" : "离线修改待提交"}</span>
+          </Show>
+          <Show when={pendingSync() && online()}>
+            <button class="btn btn-quiet" onClick={() => submitPending("离线期间的修改已手动提交")}>立即提交</button>
+          </Show>
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
           <button class="btn btn-quiet" onClick={() => setHelpOpen(true)}>快捷键 <kbd>?</kbd></button>
@@ -503,7 +688,7 @@ export default function OralHistoryEditor() {
               <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <p>修改会自动保存在本机；断网后仍可继续校对，恢复网络后自动提交。</p>
           </section>
 
           <section class="panel-section">
@@ -616,6 +801,11 @@ export default function OralHistoryEditor() {
                       {segment().reviewed ? "✓ 已校对" : "标记已校对"}
                     </button>
                   </div>
+                  <div class="segment-provenance" title="自动保存记录的片段来源">
+                    <span>来源 {segment().meta.tabId === TAB_ID ? "本标签页" : segment().meta.tabId}</span>
+                    <span>{segment().meta.editedAt ? new Date(segment().meta.editedAt).toLocaleString() : "—"}</span>
+                    <span>v{segment().meta.version}</span>
+                  </div>
 
                   <label class="field-label" for="speaker-select">发言人</label>
                   <select
@@ -687,7 +877,7 @@ export default function OralHistoryEditor() {
                 </Tabs.Content>
 
                 <Tabs.Content value="comments" class="tab-content comments-content">
-                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论。</p></div>
+                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论；多标签页合并时批注与回复始终保留。</p></div>
                   <div class="comment-compose">
                     <textarea rows="3" placeholder="记录读音、词义或专名依据…" value={commentDraft()} onInput={(event) => setCommentDraft(event.currentTarget.value)} />
                     <button class="btn btn-primary" onClick={addComment}>添加批注</button>
@@ -722,7 +912,7 @@ export default function OralHistoryEditor() {
 
       <footer class="statusbar">
         <span>最近操作：{lastAction()}</span>
-        <span>版本 {revision() + 1} · 本地草稿</span>
+        <span>版本 {revision() + 1} · {pendingSync() ? "离线修改待提交" : "本地草稿"}</span>
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
 

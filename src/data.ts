@@ -1,7 +1,13 @@
-import type { Confidence, ProjectData, Segment, Tag } from "./types";
+import type { Confidence, ProjectData, Segment, SegmentMeta, Tag } from "./types";
 
 export const uid = (prefix = "id") =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+export const createMeta = (tabId: string, version = 0): SegmentMeta => ({
+  tabId,
+  editedAt: Date.now(),
+  version,
+});
 
 export const makeTag = (label: string, type: Tag["type"], color: string): Tag => ({
   id: uid("tag"),
@@ -36,6 +42,7 @@ const segment = (
   },
   tagIds,
   comments: [],
+  meta: createMeta("seed"),
 });
 
 export const createSeedProject = (): ProjectData => {
